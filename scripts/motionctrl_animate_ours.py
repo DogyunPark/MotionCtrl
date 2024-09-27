@@ -4,6 +4,7 @@ import inspect
 import os, sys
 from omegaconf import OmegaConf
 import json
+import cv2
 
 import torch
 import torch.nn as nn
@@ -21,7 +22,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from animatediff.models.unet import UNet3DConditionModel
 from animatediff.models.sparse_controlnet import SparseControlNetModel
 from animatediff.pipelines.pipeline_animation import AnimationPipeline
-from animatediff.utils.util import save_videos_grid
+from animatediff.utils.util import save_videos_grid, save_videos_jpg
 from animatediff.utils.util import load_weights
 from diffusers.utils.import_utils import is_xformers_available
 
@@ -39,9 +40,19 @@ from motionctrl.adapter import Adapter
 from motionctrl.utils.util import instantiate_from_config
 from motionctrl.util import get_traj_features, get_batch_motion, get_opt_from_video, vis_opt_flow
 
+sys.path.append("/home/dogyun/CameraCtrl/")
+from cameractrl.data.dataset import Camera
+#from cameractrl.models.unet import UNet3DConditionModel
+#from cameractrl.pipelines.pipeline_animation import AnimationPipeline
 
 @torch.no_grad()
 def main(args):
+    os.makedirs(args.out_root, exist_ok=True)
+    video_pth = '{}/video'.format(args.out_root)
+    image_pth = '{}/image'.format(args.out_root)
+    os.makedirs(video_pth, exist_ok=True)
+    os.makedirs(image_pth, exist_ok=True)
+
     *_, func_args = inspect.getargvalues(inspect.currentframe())
     func_args = dict(func_args)
     
@@ -66,6 +77,13 @@ def main(args):
 
         inference_config = OmegaConf.load(model_config.get("inference_config", args.inference_config))
         unet = UNet3DConditionModel.from_pretrained_2d(args.pretrained_model_path, subfolder="unet", unet_additional_kwargs=OmegaConf.to_container(inference_config.unet_additional_kwargs)).cuda()
+
+        # print(f"Setting the attention processors")
+        # unet.set_all_attn_processor(add_spatial_lora=True,
+        #                             add_motion_lora=False,
+        #                             lora_kwargs={"lora_rank": 2, "lora_scale": 1.0},
+        #                             motion_lora_kwargs={"lora_rank": -1, "lora_scale": 1.0},
+        # )
 
         # load controlnet model
         controlnet = controlnet_images = None
@@ -149,6 +167,16 @@ def main(args):
             lora_model_path            = model_config.get("lora_model_path", ""),
             lora_alpha                 = model_config.get("lora_alpha", 0.8),
         ) #.to("cuda")
+
+        # image_lora_ckpt = "models/Motion_Module/RealEstate10K_LoRA.ckpt"
+        # if image_lora_ckpt is not None:
+        #     print(f"Loading the lora checkpoint from {image_lora_ckpt}")
+        #     lora_checkpoints = torch.load(image_lora_ckpt, map_location=unet.device)
+        #     if 'lora_state_dict' in lora_checkpoints.keys():
+        #         lora_checkpoints = lora_checkpoints['lora_state_dict']
+        #     _, lora_u = unet.load_state_dict(lora_checkpoints, strict=False)
+        #     assert len(lora_u) == 0
+        #     print(f'Loading done')
 
         if model_config.get("dreambooth_path", "") != "":
             savedir += "_dreambooth"
@@ -258,111 +286,148 @@ def main(args):
         random_seeds = [random_seeds] if isinstance(random_seeds, int) else list(random_seeds)
         random_seeds = random_seeds * len(prompts) if len(random_seeds) == 1 else random_seeds
         
-        RTs = []
-        RT_names = []
-        for RT_path in model_config.get("RT_paths", []):
-            with open(RT_path, 'r') as f:
-                RT = json.load(f)
-            RT = np.array(RT)
-            RT = torch.tensor(RT).float()# [t, 12]
-            RT = RT[None, ...]
+        eval_listdir = [x for x in os.listdir(args.eval_datadir)]
+        filtered_eval_listdir = eval_listdir[750:]
+        
+        for idx, listdir in tqdm(enumerate(filtered_eval_listdir)):
+            filedir = '{}/{}'.format(args.eval_datadir, listdir)
+            eval_file = [x for x in os.listdir(filedir)]
+
+            text_prompt_file = '{}/text.txt'.format(filedir)
+            with open(text_prompt_file, 'r') as f:
+                caption = f.readlines()[0]
+            
+            video_file = '{}/source_video.mp4'.format(filedir)
+            cap = cv2.VideoCapture(video_file)
+            ret, frame = cap.read()
+            original_pose_height = frame.shape[0]
+            original_pose_width = frame.shape[1]
+            
+            # Target pose1
+            print('Loading Target Pose 1 K, R, t matrix')
+            target_pose1 = '{}/target_poses1.txt'.format(filedir)
+            with open(target_pose1, 'r') as f:
+                poses = f.readlines()
+            poses = [pose.strip().split(' ') for pose in poses[1:]]
+
+            cam_params = [[float(x) for x in pose] for pose in poses]
+            cam_params = [Camera(cam_param) for cam_param in cam_params]
+            sample_wh_ratio = args.image_width / args.image_height
+            pose_wh_ratio = args.original_pose_width / args.original_pose_height
+            if pose_wh_ratio > sample_wh_ratio:
+                resized_ori_w = args.image_height * pose_wh_ratio
+                for cam_param in cam_params:
+                    cam_param.fx = resized_ori_w * cam_param.fx / args.image_width
+            else:
+                resized_ori_h = args.image_width / pose_wh_ratio
+                for cam_param in cam_params:
+                    cam_param.fy = resized_ori_h * cam_param.fy / args.image_height
+            intrinsic = np.asarray([[cam_param.fx * args.image_width,
+                                    cam_param.fy * args.image_height,
+                                    cam_param.cx * args.image_width,
+                                    cam_param.cy * args.image_height]
+                                    for cam_param in cam_params], dtype=np.float32)
+
+            K = torch.as_tensor(intrinsic)[None]  # [1, 1, 4]
+
+            c2ws = []
+            for cam_pa in cam_params:
+                c2ws.append(torch.as_tensor(cam_pa.c2w_mat).unsqueeze(0))
+            c2ws = torch.cat(c2ws)
+            RT = c2ws[:,:3].reshape(1, 16, -1)
             if model_config.guidance_scale > 1.0:
                 RT = torch.cat([torch.zeros_like(RT), RT], dim=0) 
-            RTs.append(RT.to(pipeline.device))
-            RT_name = RT_path.split("/")[-1].split(".")[0].replace("test_camera_", "")
-            RT_names.append(RT_name)
+            RT = RT.to(pipeline.device)
+            prompt = caption
+            n_prompt = None
+            traj_features = None
+                    
+            print(f"current seed: {torch.initial_seed()}")
+            print(f"sampling {prompt} ...")
+            sample = pipeline(
+                prompt,
+                negative_prompt     = n_prompt,
+                num_inference_steps = model_config.steps,
+                guidance_scale      = model_config.guidance_scale,
+                width               = model_config.W,
+                height              = model_config.H,
+                video_length        = model_config.L,
 
-        if RTs == []:
-            # if cmcm_checkpoint_path != "":
-            if cmcm_checkpoint_path is not None and os.path.exists(cmcm_checkpoint_path):
-                RTs = [torch.zeros((2, model_config.L, 12)).to(pipeline.device)]
-                RT_names.append("zero_motion")
+                controlnet_images = controlnet_images,
+                controlnet_image_index = model_config.get("controlnet_image_indexs", [0]),
+                RT = RT,
+                traj_features = traj_features,
+                omcm_min_step = model_config.get("omcm_min_step", 700),
+            ).videos
+            samples.append(sample)
+            save_name = "_".join(caption.split(" ")) + '_pose1_'
+            save_name = save_name.replace(',', '')
+            save_videos_grid(sample, f"{video_pth}/{listdir}_{save_name}.mp4")
+            save_videos_jpg(sample, f"{image_pth}", f"{listdir}_{save_name}")
+
+
+
+            # Target pose 2
+            print('Loading Target Pose 2 K, R, t matrix')
+            target_pose1 = '{}/target_poses2.txt'.format(filedir)
+            with open(target_pose1, 'r') as f:
+                poses = f.readlines()
+            poses = [pose.strip().split(' ') for pose in poses[1:]]
+
+            cam_params = [[float(x) for x in pose] for pose in poses]
+            cam_params = [Camera(cam_param) for cam_param in cam_params]
+            sample_wh_ratio = args.image_width / args.image_height
+            pose_wh_ratio = args.original_pose_width / args.original_pose_height
+            if pose_wh_ratio > sample_wh_ratio:
+                resized_ori_w = args.image_height * pose_wh_ratio
+                for cam_param in cam_params:
+                    cam_param.fx = resized_ori_w * cam_param.fx / args.image_width
             else:
-                RTs = [None]
-                RT_names.append("none_motion")
+                resized_ori_h = args.image_width / pose_wh_ratio
+                for cam_param in cam_params:
+                    cam_param.fy = resized_ori_h * cam_param.fy / args.image_height
+            intrinsic = np.asarray([[cam_param.fx * args.image_width,
+                                    cam_param.fy * args.image_height,
+                                    cam_param.cx * args.image_width,
+                                    cam_param.cy * args.image_height]
+                                    for cam_param in cam_params], dtype=np.float32)
 
-        import pdb; pdb.set_trace()
-        vis_flows = []
-        val_trajs = []
-        val_trajs_name = []
+            K = torch.as_tensor(intrinsic)[None]  # [1, 1, 4]
 
-        if use_optical_flow:
-            width, height = model_config.W, model_config.H
-            sample_n_frames = model_config.L
-            traj_cnt = 0
-            for vid_path in model_config.opt_paths:
-                assert os.path.exists(vid_path), f"video path: {vid_path} does not exist"
-                trajectoy = get_opt_from_video(opt_model, num_reg_refine, vid_path, width, height, sample_n_frames, device=pipeline.device)
-                # cfg
-                trajectoy = torch.cat([torch.zeros_like(trajectoy), trajectoy], dim=0)
-                val_trajs.append(trajectoy)
-                vis_flows.append(vis_opt_flow(trajectoy[1:]))
-                val_trajs_name.append(f'img{traj_cnt}')
-                traj_cnt += 1
-
-        if len(model_config.get("traj_paths", [])) > 0:
-            for traj_path in model_config.traj_paths:
-                trajectoy = torch.tensor(np.load(traj_path)).permute(3, 0, 1, 2).float() # [t,h,w,c]->[c,t,h,w]
-                trajectoy = trajectoy[None, ...]
-                trajectoy = torch.cat([torch.zeros_like(trajectoy), trajectoy], dim=0)
-                trajectoy = trajectoy.to(pipeline.device)
-                val_trajs.append(trajectoy)
-                vis_flows.append(vis_opt_flow(trajectoy[1:]))
-                val_trajs_name.append(traj_path.split("/")[-1].split(".")[0])
-
-        if val_trajs == []:
-            val_trajs = [None]
-            vis_flows = []
-            val_trajs_name = ["no_traj"]
-
-        config[model_idx].random_seed = []
-
-        for traj_idx, traj in enumerate(val_trajs):
-            if traj is not None:
-                traj_features = get_traj_features(traj, omcm)
-            else:
-                traj_features = None
-            for RT_idx, RT in enumerate(RTs):
-                
-                samples = []
-                if vis_flows != []:
-                    samples += [vis_flows[traj_idx]]
-                for prompt_idx, (prompt, n_prompt, random_seed) in enumerate(zip(prompts, n_prompts, random_seeds)):
+            c2ws = []
+            for cam_pa in cam_params:
+                c2ws.append(torch.as_tensor(cam_pa.c2w_mat).unsqueeze(0))
+            c2ws = torch.cat(c2ws)
+            RT = c2ws[:,:3].reshape(1, 16, -1)
+            if model_config.guidance_scale > 1.0:
+                RT = torch.cat([torch.zeros_like(RT), RT], dim=0) 
+            RT = RT.to(pipeline.device)
+            prompt = caption
+            n_prompt = None
+            traj_features = None
                     
-                    # manually set random seed for reproduction
-                    if random_seed != -1: torch.manual_seed(random_seed)
-                    else: torch.seed()
-                    config[model_idx].random_seed.append(torch.initial_seed())
-                    
-                    print(f"current seed: {torch.initial_seed()}")
-                    print(f"sampling {prompt} ...")
-                    sample = pipeline(
-                        prompt,
-                        negative_prompt     = n_prompt,
-                        num_inference_steps = model_config.steps,
-                        guidance_scale      = model_config.guidance_scale,
-                        width               = model_config.W,
-                        height              = model_config.H,
-                        video_length        = model_config.L,
+            print(f"current seed: {torch.initial_seed()}")
+            print(f"sampling {prompt} ...")
+            sample = pipeline(
+                prompt,
+                negative_prompt     = n_prompt,
+                num_inference_steps = model_config.steps,
+                guidance_scale      = model_config.guidance_scale,
+                width               = model_config.W,
+                height              = model_config.H,
+                video_length        = model_config.L,
 
-                        controlnet_images = controlnet_images,
-                        controlnet_image_index = model_config.get("controlnet_image_indexs", [0]),
-                        RT = RT,
-                        traj_features = traj_features,
-                        omcm_min_step = model_config.get("omcm_min_step", 700),
-                    ).videos
-                    samples.append(sample)
-
-                    prompt = "-".join((prompt.replace("/", "").split(" ")[:10]))
-                    save_videos_grid(sample, f"{savedir}/sample/{sample_idx}-{prompt}.gif")
-                    print(f"save to {savedir}/sample/{prompt}.gif")
-                    
-                    sample_idx += 1
-
-                samples = torch.concat(samples)
-                save_videos_grid(samples, f"{savedir}/sample-{RT_names[RT_idx]}-{val_trajs_name[traj_idx]}.gif", n_rows=4)
-
-    OmegaConf.save(config, f"{savedir}/config.yaml")
+                controlnet_images = controlnet_images,
+                controlnet_image_index = model_config.get("controlnet_image_indexs", [0]),
+                RT = RT,
+                traj_features = traj_features,
+                omcm_min_step = model_config.get("omcm_min_step", 700),
+            ).videos
+            samples.append(sample)
+            save_name = "_".join(caption.split(" ")) + '_pose2_'
+            save_name = save_name.replace(',', '')
+            save_videos_grid(sample, f"{video_pth}/{listdir}_{save_name}.mp4")
+            save_videos_jpg(sample, f"{image_pth}", f"{listdir}_{save_name}")
 
 
 if __name__ == "__main__":
@@ -376,7 +441,14 @@ if __name__ == "__main__":
     parser.add_argument("--H", type=int, default=512)
 
     parser.add_argument("--without-xformers", action="store_true")
+    
     parser.add_argument("--eval_datadir", type=str)
+    parser.add_argument("--out_root", type=str)
+    parser.add_argument("--image_height", type=int, default=256)
+    parser.add_argument("--image_width", type=int, default=384)
+    parser.add_argument("--video_length", type=int, default=16)
+    parser.add_argument("--original_pose_width", type=int, default=1280, help='the width of the video used to extract camera trajectory')
+    parser.add_argument("--original_pose_height", type=int, default=720, help='the height of the video used to extract camera trajectory')
 
     args = parser.parse_args()
     main(args)

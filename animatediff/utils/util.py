@@ -2,6 +2,7 @@ import os
 import imageio
 import numpy as np
 from typing import Union
+from PIL import Image
 
 import torch
 import torchvision
@@ -16,6 +17,18 @@ from animatediff.utils.convert_lora_safetensor_to_diffusers import convert_lora,
 
 def zero_rank_print(s):
     if (not dist.is_initialized()) and (dist.is_initialized() and dist.get_rank() == 0): print("### " + s)
+
+def save_videos_jpg(videos: torch.Tensor, path: str, frame_path: str, rescale=False, n_rows=6, fps=8):
+    videos = rearrange(videos, "b c t h w -> t b c h w")
+    outputs = []
+    for f, x in enumerate(videos):
+        x = torchvision.utils.make_grid(x, nrow=n_rows)
+        x = x.transpose(0, 1).transpose(1, 2).squeeze(-1)
+        if rescale:
+            x = (x + 1.0) / 2.0  # -1,1 -> 0,1
+        x = Image.fromarray((x * 255).numpy().astype(np.uint8))
+        frame_name = frame_path + 'frame' + '{0:04d}.jpg'.format(f)
+        x.save('{}/{}'.format(path, frame_name))
 
 
 def save_videos_grid(videos: torch.Tensor, path: str, rescale=False, n_rows=6, fps=8):
