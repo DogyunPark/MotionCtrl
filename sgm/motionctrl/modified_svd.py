@@ -106,10 +106,11 @@ def _forward_VideoTransformerBlock_attan2(self, x, context=None, timesteps=None)
         x = self.attn1(self.norm1(x)) + x
 
     if RT is not None:
-        # import pdb; pdb.set_trace()
+        #import pdb; pdb.set_trace()
         RT = RT.repeat_interleave(repeats=S, dim=0) # (b*s, t, 12)
         x = torch.cat([x, RT], dim=-1)
-            
+        
+        #import pdb; pdb.set_trace()
         x = self.cc_projection(x)
 
     if self.attn2 is not None:

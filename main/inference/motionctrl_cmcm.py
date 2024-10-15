@@ -5,10 +5,12 @@ import math
 import os
 import sys
 import time
+import imageio
 from glob import glob
 from pathlib import Path
 from typing import Optional
 
+from tqdm.auto import tqdm
 import cv2
 import numpy as np
 import torch
@@ -22,6 +24,9 @@ from torchvision.transforms import CenterCrop, Compose, Resize, ToTensor
 sys.path.insert(1, os.path.join(sys.path[0], '..', '..'))
 from sgm.util import default, instantiate_from_config
 
+sys.path.append("/home/dogyun/CameraCtrl/")
+from cameractrl.data.dataset import Camera
+
 camera_poses = [
     'test_camera_L',
     'test_camera_D',
@@ -32,6 +37,33 @@ camera_poses = [
     'test_camera_Round-ZoomIn',
     'test_camera_Round-RI_90',
 ]
+
+def save_videos_jpg(videos: torch.Tensor, path: str, frame_path: str, rescale=False, n_rows=6, fps=8):
+    videos = rearrange(videos, "b t c h w -> t b c h w")
+    outputs = []
+    for f, x in enumerate(videos):
+        x = torchvision.utils.make_grid(x, nrow=n_rows)
+        x = x.transpose(0, 1).transpose(1, 2).squeeze(-1)
+        if rescale:
+            x = (x + 1.0) / 2.0  # -1,1 -> 0,1
+        x = Image.fromarray((x * 255).numpy().astype(np.uint8))
+        frame_name = frame_path + 'frame' + '{0:04d}.jpg'.format(f)
+        x.save('{}/{}'.format(path, frame_name))
+
+def save_videos_grid(videos: torch.Tensor, path: str, rescale=False, n_rows=6, fps=8):
+    videos = rearrange(videos, "b t c h w -> t b c h w")
+    outputs = []
+    for x in videos:
+        x = torchvision.utils.make_grid(x, nrow=n_rows)
+        x = x.transpose(0, 1).transpose(1, 2).squeeze(-1)
+        if rescale:
+            x = (x + 1.0) / 2.0  # -1,1 -> 0,1
+        x = (x * 255).numpy().astype(np.uint8)
+        outputs.append(x)
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    imageio.mimsave(path, outputs, fps=fps)
+
 
 def to_relative_RT2(org_pose, keyframe_idx=0, keyframe_zero=False):
         org_pose = org_pose.reshape(-1, 3, 4) # [t, 3, 4]
@@ -115,6 +147,7 @@ def sample(
     transform: Optional[bool] = False,
     save_images: Optional[bool] = False,
     speed: float = 1.0,
+    args = None,
 ):
     """
     Simple script to generate a single sample conditioned on an image `input_path` or multiple images, one for each
@@ -135,164 +168,264 @@ def sample(
         num_steps,
     )
     torch.manual_seed(seed)
-
-    path = Path(input_path)
-    all_img_paths = []
-    if path.is_file():
-        if any([input_path.endswith(x) for x in ["jpg", "jpeg", "png"]]):
-            all_img_paths = [input_path]
-        else:
-            raise ValueError("Path is not valid image file.")
-    elif path.is_dir():
-        all_img_paths = sorted(
-            [
-                f
-                for f in path.iterdir()
-                if f.is_file() and f.suffix.lower() in [".jpg", ".jpeg", ".png"]
-            ]
-        )
-        if len(all_img_paths) == 0:
-            raise ValueError("Folder does not contain any images.")
-    else:
-        raise ValueError
     
-    if transform:
-        spatial_transform = Compose([
-            Resize(size=width),
-            CenterCrop(size=(height, width)),
-        ])
-    
-    # get camera poses
-    RTs, pose_name = get_RT(pose_dir=pose_dir, video_frames=num_frames, frame_stride=1, speed=speed)
+    os.makedirs(args.out_root, exist_ok=True)
+    video_pth = '{}/video'.format(args.out_root)
+    image_pth = '{}/image'.format(args.out_root)
+    os.makedirs(video_pth, exist_ok=True)
+    os.makedirs(image_pth, exist_ok=True)
 
-    print(f'loaded {len(all_img_paths)} images.')
-    os.makedirs(output_folder, exist_ok=True)
-    for no, input_img_path in enumerate(all_img_paths):
+    eval_listdir = [x for x in os.listdir(args.eval_datadir)]
+    filtered_eval_listdir = eval_listdir[750:1000]
+    
+    for idx, listdir in tqdm(enumerate(filtered_eval_listdir)):
+        filedir = '{}/{}'.format(args.eval_datadir, listdir)
+        eval_file = [x for x in os.listdir(filedir)]
         
-        filepath, fullflname = os.path.split(input_img_path)
-        filename, ext = os.path.splitext(fullflname)
-        print(f'-sample {no+1}: {filename} ...')
+        text_prompt_file = '{}/text.txt'.format(filedir)
+        with open(text_prompt_file, 'r') as f:
+            caption = f.readlines()[0]
+        
+        image_file = '{}/image_15.jpg'.format(filedir)
+        image = Image.open(image_file)
+        w, h = image.size
+
+        if h % 64 != 0 or w % 64 != 0:
+            width, height = map(lambda x: x - x % 64, (w, h))
+            image = image.resize((width, height))
+            print(
+                f"WARNING: Your image is of size {h}x{w} which is not divisible by 64. We are resizing to {height}x{width}!"
+            )
+        
+        image = ToTensor()(image)
+        image = image * 2.0 - 1.0
+        image = image.unsqueeze(0).to(device)
+        H, W = image.shape[2:]
+        assert image.shape[1] == 3
+        F = 8
+        C = 4
+        shape = (num_frames, C, H // F, W // F)
+        if (H, W) != (576, 1024):
+            print(
+                "WARNING: The conditioning frame you provided is not 576x1024. This leads to suboptimal performance as model was only trained on 576x1024. Consider increasing `cond_aug`."
+            )
+        if motion_bucket_id > 255:
+            print(
+                "WARNING: High motion bucket! This may lead to suboptimal performance."
+            )
+        if fps_id < 5:
+            print("WARNING: Small fps value! This may lead to suboptimal performance.")
+        if fps_id > 30:
+            print("WARNING: Large fps value! This may lead to suboptimal performance.")
 
         # RTs = RTs[0:1]
-        for RT_idx in range(len(RTs)):
-            cur_pose_name = pose_name[RT_idx]
-            print(f'--pose: {cur_pose_name} ...')
-            RT = RTs[RT_idx]
-            RT = RT.unsqueeze(0).repeat(2,1,1)
-            RT = RT.to(device)
+        # Target pose1
+        print('Loading Target Pose 1 K, R, t matrix')
+        target_pose1 = '{}/target_poses1.txt'.format(filedir)
+        with open(target_pose1, 'r') as f:
+            poses = f.readlines()
+        poses = [pose.strip().split(' ') for pose in poses[1:]]
 
-            with Image.open(input_img_path) as image:
-                if image.mode == "RGBA":
-                    image = image.convert("RGB")
-                if transform:
-                    image = spatial_transform(image)
-                if resize:
-                    image = image.resize((width, height))
-                w, h = image.size
+        cam_params = [[float(x) for x in pose] for pose in poses]
+        cam_params = [Camera(cam_param) for cam_param in cam_params]
+        sample_wh_ratio = args.image_width / args.image_height
+        pose_wh_ratio = args.original_pose_width / args.original_pose_height
+        if pose_wh_ratio > sample_wh_ratio:
+            resized_ori_w = args.image_height * pose_wh_ratio
+            for cam_param in cam_params:
+                cam_param.fx = resized_ori_w * cam_param.fx / args.image_width
+        else:
+            resized_ori_h = args.image_width / pose_wh_ratio
+            for cam_param in cam_params:
+                cam_param.fy = resized_ori_h * cam_param.fy / args.image_height
+        intrinsic = np.asarray([[cam_param.fx * args.image_width,
+                                cam_param.fy * args.image_height,
+                                cam_param.cx * args.image_width,
+                                cam_param.cy * args.image_height]
+                                for cam_param in cam_params], dtype=np.float32)
 
-                if h % 64 != 0 or w % 64 != 0:
-                    width, height = map(lambda x: x - x % 64, (w, h))
-                    image = image.resize((width, height))
-                    print(
-                        f"WARNING: Your image is of size {h}x{w} which is not divisible by 64. We are resizing to {height}x{width}!"
-                    )
+        K = torch.as_tensor(intrinsic)[None]  # [1, 1, 4]
 
-                image = ToTensor()(image)
-                image = image * 2.0 - 1.0
+        c2ws = []
+        for cam_pa in cam_params:
+            c2ws.append(torch.as_tensor(cam_pa.c2w_mat).unsqueeze(0))
+        c2ws = torch.cat(c2ws)
+        RT = c2ws[:,:3].reshape(1, 16, -1)
+        RT = RT.repeat(2,1,1)
+        RT = RT[:, :14]
+        RT = RT.type(torch.float32)
+        RT = RT.to(device)
 
-            image = image.unsqueeze(0).to(device)
-            H, W = image.shape[2:]
-            assert image.shape[1] == 3
-            F = 8
-            C = 4
-            shape = (num_frames, C, H // F, W // F)
-            if (H, W) != (576, 1024):
-                print(
-                    "WARNING: The conditioning frame you provided is not 576x1024. This leads to suboptimal performance as model was only trained on 576x1024. Consider increasing `cond_aug`."
+        value_dict = {}
+        value_dict["motion_bucket_id"] = motion_bucket_id
+        value_dict["fps_id"] = fps_id
+        value_dict["cond_aug"] = cond_aug
+        value_dict["cond_frames_without_noise"] = image
+        value_dict["cond_frames"] = image + cond_aug * torch.randn_like(image)
+
+        with torch.no_grad():
+            #with torch.autocast(device):
+            if 1:
+                batch, batch_uc = get_batch(
+                    get_unique_embedder_keys_from_conditioner(model.conditioner),
+                    value_dict,
+                    [1, num_frames],
+                    T=num_frames,
+                    device=device,
                 )
-            if motion_bucket_id > 255:
-                print(
-                    "WARNING: High motion bucket! This may lead to suboptimal performance."
+                c, uc = model.conditioner.get_unconditional_conditioning(
+                    batch,
+                    batch_uc=batch_uc,
+                    force_uc_zero_embeddings=[
+                        "cond_frames",
+                        "cond_frames_without_noise",
+                    ],
                 )
 
-            if fps_id < 5:
-                print("WARNING: Small fps value! This may lead to suboptimal performance.")
+                for k in ["crossattn", "concat"]:
+                    uc[k] = repeat(uc[k], "b ... -> b t ...", t=num_frames)
+                    uc[k] = rearrange(uc[k], "b t ... -> (b t) ...", t=num_frames)
+                    c[k] = repeat(c[k], "b ... -> b t ...", t=num_frames)
+                    c[k] = rearrange(c[k], "b t ... -> (b t) ...", t=num_frames)
 
-            if fps_id > 30:
-                print("WARNING: Large fps value! This may lead to suboptimal performance.")
+                additional_model_inputs = {}
+                additional_model_inputs["image_only_indicator"] = torch.zeros(
+                    2, num_frames
+                ).to(device)
+                #additional_model_inputs["image_only_indicator"][:,0] = 1
+                additional_model_inputs["num_video_frames"] = batch["num_video_frames"]
 
-            value_dict = {}
-            value_dict["motion_bucket_id"] = motion_bucket_id
-            value_dict["fps_id"] = fps_id
-            value_dict["cond_aug"] = cond_aug
-            value_dict["cond_frames_without_noise"] = image
-            value_dict["cond_frames"] = image + cond_aug * torch.randn_like(image)
+                
+                additional_model_inputs["RT"] = RT
 
-            with torch.no_grad():
-                with torch.autocast(device):
-                    batch, batch_uc = get_batch(
-                        get_unique_embedder_keys_from_conditioner(model.conditioner),
-                        value_dict,
-                        [1, num_frames],
-                        T=num_frames,
-                        device=device,
-                    )
-                    c, uc = model.conditioner.get_unconditional_conditioning(
-                        batch,
-                        batch_uc=batch_uc,
-                        force_uc_zero_embeddings=[
-                            "cond_frames",
-                            "cond_frames_without_noise",
-                        ],
+                def denoiser(input, sigma, c):
+                    return model.denoiser(
+                        model.model, input, sigma, c, **additional_model_inputs
                     )
 
-                    for k in ["crossattn", "concat"]:
-                        uc[k] = repeat(uc[k], "b ... -> b t ...", t=num_frames)
-                        uc[k] = rearrange(uc[k], "b t ... -> (b t) ...", t=num_frames)
-                        c[k] = repeat(c[k], "b ... -> b t ...", t=num_frames)
-                        c[k] = rearrange(c[k], "b t ... -> (b t) ...", t=num_frames)
+                results = []
+                for j in range(sample_num):
+                    randn = torch.randn(shape, device=device)
+                    samples_z = model.sampler(denoiser, randn, cond=c, uc=uc)
+                    model.en_and_decode_n_samples_a_time = decoding_t
+                    samples_x = model.decode_first_stage(samples_z)
+                    samples = torch.clamp((samples_x + 1.0) / 2.0, min=0.0, max=1.0) # [1*t, c, h, w]
+                    results.append(samples)
 
-                    
+                samples = torch.stack(results, dim=0) # [sample_num, t, c, h, w]
+                samples = samples.data.cpu()
 
-                    additional_model_inputs = {}
-                    additional_model_inputs["image_only_indicator"] = torch.zeros(
-                        2, num_frames
-                    ).to(device)
-                    #additional_model_inputs["image_only_indicator"][:,0] = 1
-                    additional_model_inputs["num_video_frames"] = batch["num_video_frames"]
+                #import pdb; pdb.set_trace()
 
-                    
-                    additional_model_inputs["RT"] = RT
+                save_name = "_".join(caption.split(" ")) + '_pose1_'
+                save_name = save_name.replace(',', '')
+                save_videos_grid(samples, f"{video_pth}/{listdir}_{save_name}.mp4")
+                save_videos_jpg(samples, f"{image_pth}", f"{listdir}_{save_name}")
+        
 
-                    def denoiser(input, sigma, c):
-                        return model.denoiser(
-                            model.model, input, sigma, c, **additional_model_inputs
-                        )
 
-                    results = []
-                    for j in range(sample_num):
-                        randn = torch.randn(shape, device=device)
-                        samples_z = model.sampler(denoiser, randn, cond=c, uc=uc)
-                        model.en_and_decode_n_samples_a_time = decoding_t
-                        samples_x = model.decode_first_stage(samples_z)
-                        samples = torch.clamp((samples_x + 1.0) / 2.0, min=0.0, max=1.0) # [1*t, c, h, w]
-                        results.append(samples)
+        print('Loading Target Pose 2 K, R, t matrix')
+        target_pose1 = '{}/target_poses2.txt'.format(filedir)
+        with open(target_pose1, 'r') as f:
+            poses = f.readlines()
+        poses = [pose.strip().split(' ') for pose in poses[1:]]
 
-                    samples = torch.stack(results, dim=0) # [sample_num, t, c, h, w]
-                    samples = samples.data.cpu()
+        cam_params = [[float(x) for x in pose] for pose in poses]
+        cam_params = [Camera(cam_param) for cam_param in cam_params]
+        sample_wh_ratio = args.image_width / args.image_height
+        pose_wh_ratio = args.original_pose_width / args.original_pose_height
+        if pose_wh_ratio > sample_wh_ratio:
+            resized_ori_w = args.image_height * pose_wh_ratio
+            for cam_param in cam_params:
+                cam_param.fx = resized_ori_w * cam_param.fx / args.image_width
+        else:
+            resized_ori_h = args.image_width / pose_wh_ratio
+            for cam_param in cam_params:
+                cam_param.fy = resized_ori_h * cam_param.fy / args.image_height
+        intrinsic = np.asarray([[cam_param.fx * args.image_width,
+                                cam_param.fy * args.image_height,
+                                cam_param.cx * args.image_width,
+                                cam_param.cy * args.image_height]
+                                for cam_param in cam_params], dtype=np.float32)
 
-                    video_path = os.path.join(output_folder, f"{filename}_{cur_pose_name}.mp4")
-                    save_results(samples, video_path, fps=save_fps)
+        K = torch.as_tensor(intrinsic)[None]  # [1, 1, 4]
 
-                    if save_images:
-                        for i in range(sample_num):
-                            cur_output_folder = os.path.join(output_folder, f"{filename}", f"{cur_pose_name}", f"{i}")
-                            os.makedirs(cur_output_folder, exist_ok=True)
-                            for j in range(num_frames):
-                                cur_img_path = os.path.join(cur_output_folder, f"{j:06d}.png")
-                                torchvision.utils.save_image(samples[i,j], cur_img_path)
-    
-    print(f'Done! results saved in {output_folder}.')
+        c2ws = []
+        for cam_pa in cam_params:
+            c2ws.append(torch.as_tensor(cam_pa.c2w_mat).unsqueeze(0))
+        c2ws = torch.cat(c2ws)
+        RT = c2ws[:,:3].reshape(1, 16, -1)
+        RT = RT.repeat(2,1,1)
+        RT = RT[:, :14]
+        RT = RT.type(torch.float32)
+        RT = RT.to(device)
+
+        value_dict = {}
+        value_dict["motion_bucket_id"] = motion_bucket_id
+        value_dict["fps_id"] = fps_id
+        value_dict["cond_aug"] = cond_aug
+        value_dict["cond_frames_without_noise"] = image
+        value_dict["cond_frames"] = image + cond_aug * torch.randn_like(image)
+
+        with torch.no_grad():
+            #with torch.autocast(device):
+            if 1:
+                batch, batch_uc = get_batch(
+                    get_unique_embedder_keys_from_conditioner(model.conditioner),
+                    value_dict,
+                    [1, num_frames],
+                    T=num_frames,
+                    device=device,
+                )
+                c, uc = model.conditioner.get_unconditional_conditioning(
+                    batch,
+                    batch_uc=batch_uc,
+                    force_uc_zero_embeddings=[
+                        "cond_frames",
+                        "cond_frames_without_noise",
+                    ],
+                )
+
+                for k in ["crossattn", "concat"]:
+                    uc[k] = repeat(uc[k], "b ... -> b t ...", t=num_frames)
+                    uc[k] = rearrange(uc[k], "b t ... -> (b t) ...", t=num_frames)
+                    c[k] = repeat(c[k], "b ... -> b t ...", t=num_frames)
+                    c[k] = rearrange(c[k], "b t ... -> (b t) ...", t=num_frames)
+
+                additional_model_inputs = {}
+                additional_model_inputs["image_only_indicator"] = torch.zeros(
+                    2, num_frames
+                ).to(device)
+                #additional_model_inputs["image_only_indicator"][:,0] = 1
+                additional_model_inputs["num_video_frames"] = batch["num_video_frames"]
+
+                
+                additional_model_inputs["RT"] = RT
+
+                def denoiser(input, sigma, c):
+                    return model.denoiser(
+                        model.model, input, sigma, c, **additional_model_inputs
+                    )
+
+                results = []
+                for j in range(sample_num):
+                    randn = torch.randn(shape, device=device)
+                    samples_z = model.sampler(denoiser, randn, cond=c, uc=uc)
+                    model.en_and_decode_n_samples_a_time = decoding_t
+                    samples_x = model.decode_first_stage(samples_z)
+                    samples = torch.clamp((samples_x + 1.0) / 2.0, min=0.0, max=1.0) # [1*t, c, h, w]
+                    results.append(samples)
+
+                samples = torch.stack(results, dim=0) # [sample_num, t, c, h, w]
+                samples = samples.data.cpu()
+
+                #import pdb; pdb.set_trace()
+
+                save_name = "_".join(caption.split(" ")) + '_pose2_'
+                save_name = save_name.replace(',', '')
+                save_videos_grid(samples, f"{video_pth}/{listdir}_{save_name}.mp4")
+                save_videos_jpg(samples, f"{image_pth}", f"{listdir}_{save_name}")
+
 
 def save_results(resutls, filename, fps=10):
     video = resutls.permute(1, 0, 2, 3, 4) # [t, sample_num, c, h, w]
@@ -399,6 +532,15 @@ def get_parser():
     parser.add_argument("--transform", action='store_true', default=False, help="resize all input to specific resolution")
     parser.add_argument("--save_images", action='store_true', default=False, help="save images")
     parser.add_argument("--speed", type=float, default=1.0, help="speed of camera motion")
+
+    parser.add_argument("--eval_datadir", type=str)
+    parser.add_argument("--out_root", type=str)
+    parser.add_argument("--image_height", type=int, default=256)
+    parser.add_argument("--image_width", type=int, default=384)
+    parser.add_argument("--video_length", type=int, default=16)
+    parser.add_argument("--original_pose_width", type=int, default=1280, help='the width of the video used to extract camera trajectory')
+    parser.add_argument("--original_pose_height", type=int, default=720, help='the height of the video used to extract camera trajectory')
+
     return parser
 
 
@@ -412,5 +554,6 @@ if __name__ == "__main__":
         fps_id=args.fps, motion_bucket_id=args.motion, cond_aug=args.cond_aug, seed=args.seed, \
         decoding_t=args.decoding_t, output_folder=args.savedir, save_fps=args.savefps, resize=args.resize,
         pose_dir=args.pose_dir, sample_num=args.sample_num, height=args.height, width=args.width,
-        transform=args.transform, save_images=args.save_images, speed=args.speed)
+        transform=args.transform, save_images=args.save_images, speed=args.speed,
+        args=args)
     
